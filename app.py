@@ -10,6 +10,7 @@ from pydantic import BaseModel
 from gradio_client import Client
 from dotenv import load_dotenv
 import uuid
+import time
 
 # =========================
 # LOAD ENV
@@ -42,7 +43,7 @@ app.add_middleware(
         "https://localhost:3000",
         FRONTEND_URL,
         "https://search-company-xc9u.onrender.com",
-        "*",  # Permettre tous les domaines temporairement
+        "*",
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -113,7 +114,7 @@ def update_progress(session_id: str, progress: float, log_msg: str = "", status:
         if log_msg:
             session.logs.append(log_msg)
 
-def save_partial_result(session_id: str, data: OSINTRequest):
+def save_partial_result(session_id: str, data: OSINTRequest, logs: list):
     """Sauvegarde les résultats partiels lors d'un arrêt"""
     session = get_or_create_session(session_id)
     with session.lock:
@@ -121,10 +122,13 @@ def save_partial_result(session_id: str, data: OSINTRequest):
             "success": False,
             "partial": True,
             "input": data.dict(),
-            "logs": session.logs,
+            "logs": logs,
             "progress": session.progress,
+            "results_markdown": "Recherche arrêtée par l'utilisateur",
+            "results_json": "{}",
             "message": "Recherche arrêtée - résultats partiels disponibles"
         }
+        session.status = "stopped"
 
 def run_osint_background(session_id: str, data: OSINTRequest):
     """Exécute OSINT en arrière-plan avec suivi de progression"""
@@ -139,83 +143,134 @@ def run_osint_background(session_id: str, data: OSINTRequest):
         
         print(f"🚀 Session {session_id} lancée: {data.company_name}")
         
+        # ÉTAPE 1
         update_progress(session_id, 10, "🔍 Initialisation de la recherche...")
+        time.sleep(0.5)
         
-        if session.stop_flag:
-            save_partial_result(session_id, data)
-            raise InterruptedError("Recherche arrêtée par l'utilisateur")
+        # ✅ VÉRIFICATION ARRÊT APRÈS CHAQUE ÉTAPE
+        with session.lock:
+            if session.stop_flag:
+                save_partial_result(session_id, data, session.logs)
+                session.logs.append("🛑 Recherche arrêtée par l'utilisateur (étape 1)")
+                print(f"⏸️ Session {session_id} arrêtée à l'étape 1")
+                return
         
+        # ÉTAPE 2
         update_progress(session_id, 25, "📱 Recherche des réseaux sociaux...")
+        time.sleep(0.5)
         
-        if session.stop_flag:
-            save_partial_result(session_id, data)
-            raise InterruptedError("Recherche arrêtée par l'utilisateur")
+        # ✅ VÉRIFICATION ARRÊT
+        with session.lock:
+            if session.stop_flag:
+                save_partial_result(session_id, data, session.logs)
+                session.logs.append("🛑 Recherche arrêtée par l'utilisateur (étape 2)")
+                print(f"⏸️ Session {session_id} arrêtée à l'étape 2")
+                return
         
+        # ÉTAPE 3
         update_progress(session_id, 50, "👥 Recherche des employés LinkedIn...")
+        time.sleep(0.5)
         
-        if session.stop_flag:
-            save_partial_result(session_id, data)
-            raise InterruptedError("Recherche arrêtée par l'utilisateur")
+        # ✅ VÉRIFICATION ARRÊT
+        with session.lock:
+            if session.stop_flag:
+                save_partial_result(session_id, data, session.logs)
+                session.logs.append("🛑 Recherche arrêtée par l'utilisateur (étape 3)")
+                print(f"⏸️ Session {session_id} arrêtée à l'étape 3")
+                return
         
+        # ÉTAPE 4
         update_progress(session_id, 75, "📧 Recherche des emails...")
+        time.sleep(0.5)
         
-        if session.stop_flag:
-            save_partial_result(session_id, data)
-            raise InterruptedError("Recherche arrêtée par l'utilisateur")
+        # ✅ VÉRIFICATION ARRÊT
+        with session.lock:
+            if session.stop_flag:
+                save_partial_result(session_id, data, session.logs)
+                session.logs.append("🛑 Recherche arrêtée par l'utilisateur (étape 4)")
+                print(f"⏸️ Session {session_id} arrêtée à l'étape 4")
+                return
         
+        # ÉTAPE 5 - APPEL API
         print(f"📡 Appel Gradio pour session {session_id}...")
         update_progress(session_id, 90, "🔄 Traitement des résultats...")
         
-        # Appel à l'API Gradio
-        result = client.predict(
-            company_name=data.company_name,
-            company_handle=data.company_handle,
-            country_name=data.country_name,
-            country_iso=data.country_iso,
-            api_name="/run_osint"
-        )
+        try:
+            result = client.predict(
+                company_name=data.company_name,
+                company_handle=data.company_handle,
+                country_name=data.country_name,
+                country_iso=data.country_iso,
+                api_name="/run_osint"
+            )
+            
+            logs, markdown, json_str = result
+            
+            # ✅ VÉRIFICATION ARRÊT AVANT COMPLÉTION
+            with session.lock:
+                if session.stop_flag:
+                    save_partial_result(session_id, data, session.logs)
+                    session.logs.append("🛑 Recherche arrêtée par l'utilisateur (étape 5)")
+                    print(f"⏸️ Session {session_id} arrêtée à l'étape 5")
+                    return
+            
+            # SUCCÈS
+            with session.lock:
+                session.result = {
+                    "success": True,
+                    "partial": False,
+                    "input": data.dict(),
+                    "logs": logs,
+                    "results_markdown": markdown,
+                    "results_json": json_str,
+                    "message": "Recherche complétée avec succès"
+                }
+                session.progress = 100
+                session.status = "completed"
+                session.logs.append("✅ OSINT terminé avec succès !")
+            
+            print(f"✅ Session {session_id} complétée avec succès")
         
-        logs, markdown, json_str = result
-        
-        # Vérifier une dernière fois avant de compléter
-        if session.stop_flag:
-            save_partial_result(session_id, data)
-            raise InterruptedError("Recherche arrêtée par l'utilisateur")
-        
-        with session.lock:
-            session.result = {
-                "success": True,
-                "partial": False,
-                "input": data.dict(),
-                "logs": logs,
-                "results_markdown": markdown,
-                "results_json": json_str
-            }
-            session.progress = 100
-            session.status = "completed"
-            session.logs.append("✅ OSINT terminé avec succès !")
-        
-        print(f"✅ Session {session_id} complétée avec succès")
-    
-    except InterruptedError as e:
-        with session.lock:
-            session.status = "stopped"
-            session.logs.append(f"🛑 {str(e)}")
-        print(f"⏸️ Session {session_id} arrêtée par l'utilisateur")
-    
+        except Exception as gradio_error:
+            print(f"❌ Erreur Gradio pour session {session_id}: {str(gradio_error)}")
+            
+            # Vérifier si c'est un arrêt pendant l'appel Gradio
+            with session.lock:
+                if session.stop_flag:
+                    save_partial_result(session_id, data, session.logs)
+                    session.logs.append("🛑 Recherche arrêtée pendant l'appel API")
+                    return
+            
+            # Sinon, erreur réelle
+            with session.lock:
+                session.status = "error"
+                session.logs.append(f"❌ Erreur Gradio : {str(gradio_error)}")
+                session.result = {
+                    "success": False,
+                    "partial": False,
+                    "input": data.dict(),
+                    "logs": session.logs,
+                    "error": str(gradio_error),
+                    "message": "Erreur lors de l'appel API"
+                }
+            raise
+
     except Exception as e:
         print(f"❌ Session {session_id} erreur: {str(e)}")
+        
+        # Vérifier si c'est un arrêt volontaire
         with session.lock:
-            session.status = "error"
-            session.logs.append(f"❌ Erreur : {str(e)}")
-            session.result = {
-                "success": False,
-                "partial": False,
-                "input": data.dict(),
-                "logs": session.logs,
-                "error": str(e),
-                "message": "Une erreur s'est produite"
-            }
+            if not session.stop_flag and session.status != "stopped":
+                session.status = "error"
+                session.logs.append(f"❌ Erreur : {str(e)}")
+                session.result = {
+                    "success": False,
+                    "partial": False,
+                    "input": data.dict(),
+                    "logs": session.logs,
+                    "error": str(e),
+                    "message": "Une erreur s'est produite"
+                }
 
 # =========================
 # API 1: TEST SANS JWT
@@ -245,7 +300,7 @@ def predict_osint_test(data: OSINTRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 # =========================
-# API 2: PREDICT OSINT (SANS JWT)
+# API 2: PREDICT OSINT
 # =========================
 
 @app.post("/predict-osint")
@@ -253,7 +308,7 @@ def predict_osint(
     data: OSINTRequest,
     background_tasks: BackgroundTasks
 ):
-    """Lance une recherche OSINT de manière asynchrone (SANS JWT)"""
+    """Lance une recherche OSINT de manière asynchrone"""
     
     print(f"🚀 Recherche lancée: {data.company_name}")
     
@@ -276,7 +331,7 @@ def predict_osint(
 
 @app.get("/progress/{session_id}", response_model=ProgressResponse)
 def get_progress(session_id: str):
-    """Récupère la progression en temps réel d'une recherche OSINT (SANS JWT)"""
+    """Récupère la progression en temps réel d'une recherche OSINT"""
     session = get_or_create_session(session_id)
     
     with session.lock:
@@ -294,7 +349,7 @@ def get_progress(session_id: str):
 
 @app.post("/stop/{session_id}", response_model=StopResponse)
 def stop_osint_search(session_id: str):
-    """Arrête une recherche OSINT en cours (SANS JWT)"""
+    """Arrête une recherche OSINT en cours"""
     session = get_or_create_session(session_id)
     
     with session.lock:
@@ -306,16 +361,18 @@ def stop_osint_search(session_id: str):
                 result=session.result
             )
         
-        # Marquer le flag d'arrêt
+        # ✅ DÉFINIR LE FLAG D'ARRÊT
         session.stop_flag = True
+        session.logs.append("🛑 Arrêt demandé...")
         
         print(f"⏹️ Arrêt demandé pour session {session_id}")
         
+        # Retourner immédiatement
         return StopResponse(
             session_id=session_id,
-            message="Recherche arrêtée - résultats partiels sauvegardés",
+            message="Arrêt en cours - résultats partiels seront sauvegardés",
             status="stopped",
-            result=session.result  # Peut être None initialement, sera rempli après
+            result=session.result
         )
 
 # =========================
@@ -324,7 +381,7 @@ def stop_osint_search(session_id: str):
 
 @app.delete("/session/{session_id}")
 def clear_session(session_id: str):
-    """Nettoie une session terminée (SANS JWT)"""
+    """Nettoie une session terminée"""
     if session_id in sessions:
         session = sessions[session_id]
         with session.lock:
@@ -367,7 +424,8 @@ def get_all_sessions():
                 "status": s.status,
                 "progress": s.progress,
                 "logs_count": len(s.logs),
-                "has_result": s.result is not None
+                "has_result": s.result is not None,
+                "stop_flag": s.stop_flag
             }
             for sid, s in sessions.items()
         }
@@ -412,13 +470,14 @@ def root():
     """Root endpoint"""
     return {
         "app": "OSINT API Gateway",
-        "version": "1.0.1",
+        "version": "1.0.2",
         "status": "running",
         "features": [
             "Async OSINT search",
             "Real-time progress tracking",
             "Partial results on stop",
-            "Session management"
+            "Session management",
+            "Proper stop handling"
         ],
         "endpoints": {
             "health": "GET /health",
