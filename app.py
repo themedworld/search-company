@@ -1,10 +1,9 @@
 import os
-import jwt
 import asyncio
 import threading
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any
-from fastapi import FastAPI, HTTPException, Depends, Header, BackgroundTasks
+from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -22,7 +21,6 @@ HF_SPACE_URL = os.getenv(
     "https://themedworld-searchcompay.hf.space"
 )
 
-JWT_SECRET = os.getenv("JWT_SECRET", "super-secret-key")
 FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:3000")
 
 # =========================
@@ -32,7 +30,7 @@ FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:3000")
 app = FastAPI(title="OSINT API Gateway")
 
 # =========================
-# CORS MIDDLEWARE (IMPORTANT!)
+# CORS MIDDLEWARE
 # =========================
 
 app.add_middleware(
@@ -42,7 +40,8 @@ app.add_middleware(
         "http://localhost:3001",
         "https://localhost:3000",
         FRONTEND_URL,
-        "https://search-company-xc9u.onrender.com",  # Ton domaine Render
+        "https://search-company-xc9u.onrender.com",
+        "*",  # Permettre tous les domaines temporairement
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -62,14 +61,13 @@ client = Client(HF_SPACE_URL)
 
 class OSINTSession:
     def __init__(self):
-        self.progress = 0.0  # 0 to 100
-        self.status = "idle"  # idle, running, stopped, completed, error
+        self.progress = 0.0
+        self.status = "idle"
         self.result = None
         self.logs = []
         self.stop_flag = False
         self.lock = threading.Lock()
 
-# Global session storage (in production, use Redis or database)
 sessions: Dict[str, OSINTSession] = {}
 
 def get_or_create_session(session_id: str) -> OSINTSession:
@@ -100,22 +98,6 @@ class StopResponse(BaseModel):
     message: str
     status: str
     result: Optional[Dict[str, Any]] = None
-
-# =========================
-# JWT VERIFY
-# =========================
-
-def verify_token(authorization: Optional[str] = Header(None)):
-    if not authorization:
-        raise HTTPException(status_code=401, detail="Token manquant")
-    try:
-        scheme, token = authorization.split()
-        if scheme.lower() != "bearer":
-            raise HTTPException(status_code=401, detail="Bearer requis")
-        payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
-        return payload
-    except Exception:
-        raise HTTPException(status_code=401, detail="Token invalide")
 
 # =========================
 # COMMON FUNCTION
@@ -160,6 +142,7 @@ def run_osint_background(session_id: str, data: OSINTRequest):
         if session.stop_flag:
             raise InterruptedError("Recherche arrêtée par l'utilisateur")
         
+        print(f"📡 Appel Gradio pour session {session_id}...")
         result = client.predict(
             company_name=data.company_name,
             company_handle=data.company_handle,
@@ -181,6 +164,8 @@ def run_osint_background(session_id: str, data: OSINTRequest):
             session.progress = 100
             session.status = "completed"
             session.logs.append("✅ OSINT terminé avec succès !")
+        
+        print(f"✅ Session {session_id} complétée")
     
     except InterruptedError as e:
         with session.lock:
@@ -189,6 +174,7 @@ def run_osint_background(session_id: str, data: OSINTRequest):
             if session.result:
                 session.result["success"] = False
                 session.result["stopped"] = True
+        print(f"⏸️ Session {session_id} arrêtée")
     
     except Exception as e:
         with session.lock:
@@ -198,6 +184,7 @@ def run_osint_background(session_id: str, data: OSINTRequest):
                 "success": False,
                 "error": str(e)
             }
+        print(f"❌ Session {session_id} erreur: {str(e)}")
 
 # =========================
 # API 1: TEST SANS JWT
@@ -205,6 +192,8 @@ def run_osint_background(session_id: str, data: OSINTRequest):
 
 @app.post("/predict-osint-test")
 def predict_osint_test(data: OSINTRequest):
+    """Test endpoint sans authentification"""
+    print(f"🧪 TEST: {data.company_name}")
     result = client.predict(
         company_name=data.company_name,
         company_handle=data.company_handle,
@@ -222,17 +211,18 @@ def predict_osint_test(data: OSINTRequest):
     }
 
 # =========================
-# API 2: AVEC JWT
+# API 2: PREDICT OSINT (SANS JWT)
 # =========================
 
 @app.post("/predict-osint")
 def predict_osint(
     data: OSINTRequest,
-    token_data: dict = Depends(verify_token),
     background_tasks: BackgroundTasks = None
 ):
-    """Lance une recherche OSINT de manière asynchrone"""
+    """Lance une recherche OSINT de manière asynchrone (SANS JWT)"""
     import uuid
+    
+    print(f"🚀 Recherche lancée: {data.company_name}")
     
     session_id = data.session_id or str(uuid.uuid4())
     session = get_or_create_session(session_id)
@@ -251,8 +241,8 @@ def predict_osint(
 # =========================
 
 @app.get("/progress/{session_id}", response_model=ProgressResponse)
-def get_progress(session_id: str, token_data: dict = Depends(verify_token)):
-    """Récupère la progression en temps réel d'une recherche OSINT"""
+def get_progress(session_id: str):
+    """Récupère la progression en temps réel d'une recherche OSINT (SANS JWT)"""
     session = get_or_create_session(session_id)
     
     with session.lock:
@@ -269,11 +259,8 @@ def get_progress(session_id: str, token_data: dict = Depends(verify_token)):
 # =========================
 
 @app.post("/stop/{session_id}", response_model=StopResponse)
-def stop_osint_search(
-    session_id: str,
-    token_data: dict = Depends(verify_token)
-):
-    """Arrête une recherche OSINT en cours et retourne les résultats partiels"""
+def stop_osint_search(session_id: str):
+    """Arrête une recherche OSINT en cours (SANS JWT)"""
     session = get_or_create_session(session_id)
     
     with session.lock:
@@ -289,6 +276,8 @@ def stop_osint_search(
         session.status = "stopped"
         session.logs.append("🛑 Arrêt demandé — retour des résultats partiels.")
         
+        print(f"⏹️ Arrêt demandé pour session {session_id}")
+        
         return StopResponse(
             session_id=session_id,
             message="Recherche arrêtée avec succès",
@@ -301,16 +290,14 @@ def stop_osint_search(
 # =========================
 
 @app.delete("/session/{session_id}")
-def clear_session(
-    session_id: str,
-    token_data: dict = Depends(verify_token)
-):
-    """Nettoie une session terminée"""
+def clear_session(session_id: str):
+    """Nettoie une session terminée (SANS JWT)"""
     if session_id in sessions:
         session = sessions[session_id]
         with session.lock:
             if session.status in ["completed", "stopped", "error"]:
                 del sessions[session_id]
+                print(f"🗑️ Session {session_id} supprimée")
                 return {"message": "Session supprimée"}
             else:
                 raise HTTPException(
@@ -320,26 +307,36 @@ def clear_session(
     raise HTTPException(status_code=404, detail="Session non trouvée")
 
 # =========================
-# API 6: GÉNÉRER TOKEN
-# =========================
-
-@app.post("/generate-token")
-def generate_token():
-    payload = {
-        "sub": "user-osint",
-        "iat": datetime.utcnow(),
-        "exp": datetime.utcnow() + timedelta(days=7)
-    }
-    token = jwt.encode(payload, JWT_SECRET, algorithm="HS256")
-    return {"token": token}
-
-# =========================
-# API 7: HEALTH
+# API 6: HEALTH CHECK
 # =========================
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    """Health check endpoint"""
+    return {
+        "status": "ok",
+        "message": "OSINT API Gateway is running",
+        "active_sessions": len(sessions)
+    }
+
+# =========================
+# API 7: GET ALL SESSIONS (DEBUG)
+# =========================
+
+@app.get("/sessions")
+def get_all_sessions():
+    """DEBUG: Voir toutes les sessions actives"""
+    return {
+        "total_sessions": len(sessions),
+        "sessions": {
+            sid: {
+                "status": s.status,
+                "progress": s.progress,
+                "logs_count": len(s.logs)
+            }
+            for sid, s in sessions.items()
+        }
+    }
 
 # =========================
 # OPTIONS (pour les preflight requests)
@@ -349,3 +346,28 @@ def health():
 async def options_handler(full_path: str):
     """Gère les requêtes OPTIONS (preflight CORS)"""
     return {}
+
+# =========================
+# ROOT ENDPOINT
+# =========================
+
+@app.get("/")
+def root():
+    """Root endpoint"""
+    return {
+        "app": "OSINT API Gateway",
+        "version": "1.0.0",
+        "status": "running",
+        "endpoints": {
+            "health": "GET /health",
+            "sessions_debug": "GET /sessions",
+            "predict": "POST /predict-osint",
+            "progress": "GET /progress/{session_id}",
+            "stop": "POST /stop/{session_id}",
+            "clear": "DELETE /session/{session_id}",
+        }
+    }
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
