@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 from typing import Optional, Dict, Any
 from fastapi import FastAPI, HTTPException, Depends, Header, BackgroundTasks
 from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from gradio_client import Client
 from dotenv import load_dotenv
@@ -22,12 +23,32 @@ HF_SPACE_URL = os.getenv(
 )
 
 JWT_SECRET = os.getenv("JWT_SECRET", "super-secret-key")
+FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:3000")
 
 # =========================
 # APP
 # =========================
 
 app = FastAPI(title="OSINT API Gateway")
+
+# =========================
+# CORS MIDDLEWARE (IMPORTANT!)
+# =========================
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:3000",
+        "http://localhost:3001",
+        "https://localhost:3000",
+        FRONTEND_URL,
+        "https://search-company-xc9u.onrender.com",  # Ton domaine Render
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+    expose_headers=["*"],
+)
 
 # =========================
 # CLIENT
@@ -65,12 +86,12 @@ class OSINTRequest(BaseModel):
     company_handle: str
     country_name: str = "Tunisia"
     country_iso: str = "TN"
-    session_id: Optional[str] = None  # Pour tracker la session
+    session_id: Optional[str] = None
 
 class ProgressResponse(BaseModel):
     session_id: str
-    progress: float  # 0-100
-    status: str  # idle, running, stopped, completed, error
+    progress: float
+    status: str
     logs: list
     result: Optional[Dict[str, Any]] = None
 
@@ -121,7 +142,6 @@ def run_osint_background(session_id: str, data: OSINTRequest):
         
         update_progress(session_id, 10, "🔍 Initialisation de la recherche...")
         
-        # Vérifier le flag d'arrêt avant chaque étape importante
         if session.stop_flag:
             raise InterruptedError("Recherche arrêtée par l'utilisateur")
         
@@ -140,7 +160,6 @@ def run_osint_background(session_id: str, data: OSINTRequest):
         if session.stop_flag:
             raise InterruptedError("Recherche arrêtée par l'utilisateur")
         
-        # Appel au service Gradio
         result = client.predict(
             company_name=data.company_name,
             company_handle=data.company_handle,
@@ -218,7 +237,6 @@ def predict_osint(
     session_id = data.session_id or str(uuid.uuid4())
     session = get_or_create_session(session_id)
     
-    # Lancer la recherche en arrière-plan
     background_tasks.add_task(run_osint_background, session_id, data)
     
     return {
@@ -322,3 +340,12 @@ def generate_token():
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+# =========================
+# OPTIONS (pour les preflight requests)
+# =========================
+
+@app.options("/{full_path:path}")
+async def options_handler(full_path: str):
+    """Gère les requêtes OPTIONS (preflight CORS)"""
+    return {}
