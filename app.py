@@ -1,16 +1,14 @@
 import os
-import asyncio
 import threading
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Optional, Dict, Any
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from gradio_client import Client
 from dotenv import load_dotenv
 import uuid
-import time
+import sys
 
 # =========================
 # LOAD ENV
@@ -22,8 +20,25 @@ HF_SPACE_URL = os.getenv(
     "HF_SPACE_URL",
     "https://themedworld-searchcompay.hf.space"
 )
-
 FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:3000")
+
+# =========================
+# IMPORT OSINT ENGINE
+# =========================
+# On importe directement les fonctions de app.py (même conteneur HF Space)
+# Si app.py est dans le même répertoire :
+sys.path.insert(0, os.path.dirname(__file__))
+
+try:
+    from app import run_osint_with_session, set_stop_event
+    OSINT_MODE = "local"
+    print("✅ OSINT engine importé localement depuis app.py")
+except ImportError:
+    # Fallback : utiliser le client Gradio si app.py n'est pas disponible localement
+    from gradio_client import Client
+    _gradio_client = Client(HF_SPACE_URL)
+    OSINT_MODE = "gradio"
+    print(f"⚠️  OSINT engine via Gradio client : {HF_SPACE_URL}")
 
 # =========================
 # APP
@@ -52,23 +67,17 @@ app.add_middleware(
 )
 
 # =========================
-# CLIENT
-# =========================
-
-client = Client(HF_SPACE_URL)
-
-# =========================
-# GLOBAL STATE MANAGEMENT
+# SESSION MANAGEMENT
 # =========================
 
 class OSINTSession:
     def __init__(self):
         self.progress = 0.0
-        self.status = "idle"
-        self.result = None
-        self.logs = []
+        self.status   = "idle"
+        self.result   = None
+        self.logs     = []
         self.stop_flag = False
-        self.lock = threading.Lock()
+        self.lock      = threading.Lock()
 
 sessions: Dict[str, OSINTSession] = {}
 
@@ -85,7 +94,7 @@ class OSINTRequest(BaseModel):
     company_name: str
     company_handle: str
     country_name: str = "Tunisia"
-    country_iso: str = "TN"
+    country_iso: str  = "TN"
     session_id: Optional[str] = None
 
 class ProgressResponse(BaseModel):
@@ -102,393 +111,341 @@ class StopResponse(BaseModel):
     result: Optional[Dict[str, Any]] = None
 
 # =========================
-# COMMON FUNCTIONS
+# HELPERS
 # =========================
 
-def update_progress(session_id: str, progress: float, log_msg: str = "", status: str = "running"):
-    """Met à jour la progression et les logs"""
+def update_progress(session_id: str, progress: float,
+                    log_msg: str = "", status: str = "running"):
     session = get_or_create_session(session_id)
     with session.lock:
         session.progress = min(progress, 100.0)
-        session.status = status
+        session.status   = status
         if log_msg:
             session.logs.append(log_msg)
 
-def save_partial_result(session_id: str, data: OSINTRequest, logs: list):
-    """Sauvegarde les résultats partiels lors d'un arrêt"""
-    session = get_or_create_session(session_id)
-    with session.lock:
-        session.result = {
-            "success": False,
-            "partial": True,
-            "input": data.dict(),
-            "logs": logs,
-            "progress": session.progress,
-            "results_markdown": "Recherche arrêtée par l'utilisateur",
-            "results_json": "{}",
-            "message": "Recherche arrêtée - résultats partiels disponibles"
-        }
-        session.status = "stopped"
 
 def run_osint_background(session_id: str, data: OSINTRequest):
-    """Exécute OSINT en arrière-plan avec suivi de progression"""
+    """
+    Exécute OSINT en arrière-plan.
+
+    Flux corrigé :
+    1. On lance run_osint_with_session() qui fait le vrai travail.
+    2. Quand la fonction retourne (normalement OU après InterruptedError),
+       on récupère markdown + json et on les stocke dans la session.
+    3. Si stop_flag était levé, on marque partial=True.
+    """
     session = get_or_create_session(session_id)
-    
+
+    with session.lock:
+        session.status    = "running"
+        session.progress  = 0
+        session.logs      = []
+        session.stop_flag = False
+
+    print(f"🚀 Session {session_id} lancée : {data.company_name}")
+
     try:
-        with session.lock:
-            session.status = "running"
-            session.progress = 0
-            session.logs = []
-            session.stop_flag = False
-        
-        print(f"🚀 Session {session_id} lancée: {data.company_name}")
-        
-        # ÉTAPE 1
-        update_progress(session_id, 10, "🔍 Initialisation de la recherche...")
-        time.sleep(0.5)
-        
-        # ✅ VÉRIFICATION ARRÊT APRÈS CHAQUE ÉTAPE
-        with session.lock:
-            if session.stop_flag:
-                save_partial_result(session_id, data, session.logs)
-                session.logs.append("🛑 Recherche arrêtée par l'utilisateur (étape 1)")
-                print(f"⏸️ Session {session_id} arrêtée à l'étape 1")
-                return
-        
-        # ÉTAPE 2
-        update_progress(session_id, 25, "📱 Recherche des réseaux sociaux...")
-        time.sleep(0.5)
-        
-        # ✅ VÉRIFICATION ARRÊT
-        with session.lock:
-            if session.stop_flag:
-                save_partial_result(session_id, data, session.logs)
-                session.logs.append("🛑 Recherche arrêtée par l'utilisateur (étape 2)")
-                print(f"⏸️ Session {session_id} arrêtée à l'étape 2")
-                return
-        
-        # ÉTAPE 3
-        update_progress(session_id, 50, "👥 Recherche des employés LinkedIn...")
-        time.sleep(0.5)
-        
-        # ✅ VÉRIFICATION ARRÊT
-        with session.lock:
-            if session.stop_flag:
-                save_partial_result(session_id, data, session.logs)
-                session.logs.append("🛑 Recherche arrêtée par l'utilisateur (étape 3)")
-                print(f"⏸️ Session {session_id} arrêtée à l'étape 3")
-                return
-        
-        # ÉTAPE 4
-        update_progress(session_id, 75, "📧 Recherche des emails...")
-        time.sleep(0.5)
-        
-        # ✅ VÉRIFICATION ARRÊT
-        with session.lock:
-            if session.stop_flag:
-                save_partial_result(session_id, data, session.logs)
-                session.logs.append("🛑 Recherche arrêtée par l'utilisateur (étape 4)")
-                print(f"⏸️ Session {session_id} arrêtée à l'étape 4")
-                return
-        
-        # ÉTAPE 5 - APPEL API
-        print(f"📡 Appel Gradio pour session {session_id}...")
-        update_progress(session_id, 90, "🔄 Traitement des résultats...")
-        
-        try:
-            result = client.predict(
-                company_name=data.company_name,
-                company_handle=data.company_handle,
-                country_name=data.country_name,
-                country_iso=data.country_iso,
-                api_name="/run_osint"
+        update_progress(session_id, 5, "🔍 Initialisation de la recherche...")
+
+        # ── Appel principal ──────────────────────────────────
+        if OSINT_MODE == "local":
+            # Appel direct — run_osint_with_session gère le stop via set_stop_event()
+            logs_str, markdown, json_str = run_osint_with_session(
+                company_name   = data.company_name,
+                company_handle = data.company_handle,
+                country_name   = data.country_name,
+                country_iso    = data.country_iso,
+                session_id     = session_id,
             )
-            
-            logs, markdown, json_str = result
-            
-            # ✅ VÉRIFICATION ARRÊT AVANT COMPLÉTION
-            with session.lock:
-                if session.stop_flag:
-                    save_partial_result(session_id, data, session.logs)
-                    session.logs.append("🛑 Recherche arrêtée par l'utilisateur (étape 5)")
-                    print(f"⏸️ Session {session_id} arrêtée à l'étape 5")
-                    return
-            
-            # SUCCÈS
-            with session.lock:
-                session.result = {
-                    "success": True,
-                    "partial": False,
-                    "input": data.dict(),
-                    "logs": logs,
-                    "results_markdown": markdown,
-                    "results_json": json_str,
-                    "message": "Recherche complétée avec succès"
-                }
-                session.progress = 100
-                session.status = "completed"
-                session.logs.append("✅ OSINT terminé avec succès !")
-            
-            print(f"✅ Session {session_id} complétée avec succès")
-        
-        except Exception as gradio_error:
-            print(f"❌ Erreur Gradio pour session {session_id}: {str(gradio_error)}")
-            
-            # Vérifier si c'est un arrêt pendant l'appel Gradio
-            with session.lock:
-                if session.stop_flag:
-                    save_partial_result(session_id, data, session.logs)
-                    session.logs.append("🛑 Recherche arrêtée pendant l'appel API")
-                    return
-            
-            # Sinon, erreur réelle
-            with session.lock:
-                session.status = "error"
-                session.logs.append(f"❌ Erreur Gradio : {str(gradio_error)}")
-                session.result = {
-                    "success": False,
-                    "partial": False,
-                    "input": data.dict(),
-                    "logs": session.logs,
-                    "error": str(gradio_error),
-                    "message": "Erreur lors de l'appel API"
-                }
-            raise
+        else:
+            # Fallback Gradio client (bloquant — le stop ne peut qu'arriver après)
+            update_progress(session_id, 10, "📡 Connexion au service OSINT...")
+            result_tuple = _gradio_client.predict(
+                company_name   = data.company_name,
+                company_handle = data.company_handle,
+                country_name   = data.country_name,
+                country_iso    = data.country_iso,
+                api_name       = "/run_osint_with_session",
+            )
+            logs_str, markdown, json_str = result_tuple
+
+        # ── Vérifier si un arrêt a été demandé pendant l'exécution ──
+        with session.lock:
+            was_stopped = session.stop_flag
+
+        # ── Stocker le résultat (partiel ou complet) ──────────
+        logs_list = logs_str.split("\n") if isinstance(logs_str, str) else logs_str
+
+        with session.lock:
+            session.result = {
+                "success"         : not was_stopped,
+                "partial"         : was_stopped,          # ← clé du fix
+                "input"           : data.dict(),
+                "logs"            : logs_list,
+                "results_markdown": markdown,              # ← toujours les vraies données
+                "results_json"    : json_str,              # ← toujours les vraies données
+                "message"         : (
+                    "Recherche arrêtée — résultats partiels disponibles"
+                    if was_stopped else
+                    "Recherche complétée avec succès"
+                ),
+            }
+            session.progress = session.progress if was_stopped else 100.0
+            session.status   = "stopped" if was_stopped else "completed"
+            session.logs     = logs_list
+            session.logs.append(
+                "🛑 Arrêté — résultats partiels sauvegardés"
+                if was_stopped else
+                "✅ OSINT terminé avec succès !"
+            )
+
+        print(f"{'⏸️ Arrêté' if was_stopped else '✅ Complété'} — session {session_id}")
 
     except Exception as e:
-        print(f"❌ Session {session_id} erreur: {str(e)}")
-        
-        # Vérifier si c'est un arrêt volontaire
+        print(f"❌ Session {session_id} erreur : {e}")
         with session.lock:
-            if not session.stop_flag and session.status != "stopped":
+            # Ne pas écraser un statut "stopped" déjà positionné
+            if session.status != "stopped":
                 session.status = "error"
                 session.logs.append(f"❌ Erreur : {str(e)}")
                 session.result = {
-                    "success": False,
-                    "partial": False,
-                    "input": data.dict(),
-                    "logs": session.logs,
-                    "error": str(e),
-                    "message": "Une erreur s'est produite"
+                    "success"         : False,
+                    "partial"         : False,
+                    "input"           : data.dict(),
+                    "logs"            : session.logs,
+                    "error"           : str(e),
+                    "results_markdown": "",
+                    "results_json"    : "{}",
+                    "message"         : "Une erreur s'est produite",
                 }
 
 # =========================
-# API 1: TEST SANS JWT
+# API 1 : TEST SANS JWT
 # =========================
 
 @app.post("/predict-osint-test")
 def predict_osint_test(data: OSINTRequest):
-    """Test endpoint sans authentification"""
-    print(f"🧪 TEST: {data.company_name}")
+    """Test endpoint sans authentification — appel synchrone."""
+    print(f"🧪 TEST : {data.company_name}")
     try:
-        result = client.predict(
-            company_name=data.company_name,
-            company_handle=data.company_handle,
-            country_name=data.country_name,
-            country_iso=data.country_iso,
-            api_name="/run_osint"
-        )
-        logs, markdown, json_str = result
+        if OSINT_MODE == "local":
+            logs_str, markdown, json_str = run_osint_with_session(
+                data.company_name, data.company_handle,
+                data.country_name, data.country_iso,
+                session_id=str(uuid.uuid4()),
+            )
+        else:
+            result = _gradio_client.predict(
+                company_name   = data.company_name,
+                company_handle = data.company_handle,
+                country_name   = data.country_name,
+                country_iso    = data.country_iso,
+                api_name       = "/run_osint",
+            )
+            logs_str, markdown, json_str = result
+
         return {
-            "success": True,
-            "input": data.dict(),
-            "logs": logs,
+            "success"         : True,
+            "input"           : data.dict(),
+            "logs"            : logs_str,
             "results_markdown": markdown,
-            "results_json": json_str
+            "results_json"    : json_str,
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 # =========================
-# API 2: PREDICT OSINT
+# API 2 : LANCER OSINT ASYNC
 # =========================
 
 @app.post("/predict-osint")
-def predict_osint(
-    data: OSINTRequest,
-    background_tasks: BackgroundTasks
-):
-    """Lance une recherche OSINT de manière asynchrone"""
-    
-    print(f"🚀 Recherche lancée: {data.company_name}")
-    
+def predict_osint(data: OSINTRequest, background_tasks: BackgroundTasks):
+    """Lance une recherche OSINT de manière asynchrone."""
+    print(f"🚀 Recherche lancée : {data.company_name}")
+
     session_id = data.session_id or str(uuid.uuid4())
-    session = get_or_create_session(session_id)
-    
-    # Ajouter la tâche de fond
+    get_or_create_session(session_id)
+
     background_tasks.add_task(run_osint_background, session_id, data)
-    
+
     return {
-        "session_id": session_id,
-        "message": "Recherche lancée",
-        "status": "running",
-        "progress_url": f"/progress/{session_id}"
+        "session_id"  : session_id,
+        "message"     : "Recherche lancée",
+        "status"      : "running",
+        "progress_url": f"/progress/{session_id}",
     }
 
 # =========================
-# API 3: OBTENIR LA PROGRESSION EN TEMPS RÉEL
+# API 3 : PROGRESSION
 # =========================
 
 @app.get("/progress/{session_id}", response_model=ProgressResponse)
 def get_progress(session_id: str):
-    """Récupère la progression en temps réel d'une recherche OSINT"""
+    """Récupère la progression en temps réel."""
     session = get_or_create_session(session_id)
-    
     with session.lock:
         return ProgressResponse(
-            session_id=session_id,
-            progress=session.progress,
-            status=session.status,
-            logs=session.logs,
-            result=session.result
+            session_id = session_id,
+            progress   = session.progress,
+            status     = session.status,
+            logs       = session.logs,
+            result     = session.result,
         )
 
 # =========================
-# API 4: ARRÊTER UNE RECHERCHE EN COURS
+# API 4 : ARRÊTER
 # =========================
 
 @app.post("/stop/{session_id}", response_model=StopResponse)
 def stop_osint_search(session_id: str):
-    """Arrête une recherche OSINT en cours"""
+    """
+    Arrête une recherche OSINT en cours.
+
+    Mécanisme :
+    - On lève session.stop_flag (lu par run_osint_background)
+    - On lève set_stop_event(session_id) (lu par les fonctions internes de app.py)
+    - On retourne immédiatement — le background thread finit proprement
+      et sauvegarde les résultats partiels réels.
+    """
     session = get_or_create_session(session_id)
-    
+
     with session.lock:
         if session.status not in ["running", "idle"]:
             return StopResponse(
-                session_id=session_id,
-                message=f"Impossible d'arrêter - Statut actuel: {session.status}",
-                status=session.status,
-                result=session.result
+                session_id = session_id,
+                message    = f"Impossible d'arrêter - Statut actuel : {session.status}",
+                status     = session.status,
+                result     = session.result,
             )
-        
-        # ✅ DÉFINIR LE FLAG D'ARRÊT
+
+        # Lever les deux flags
         session.stop_flag = True
         session.logs.append("🛑 Arrêt demandé...")
-        
-        print(f"⏹️ Arrêt demandé pour session {session_id}")
-        
-        # Retourner immédiatement
-        return StopResponse(
-            session_id=session_id,
-            message="Arrêt en cours - résultats partiels seront sauvegardés",
-            status="stopped",
-            result=session.result
-        )
+
+    # Lever le flag interne de app.py (propagé à toutes les sous-fonctions)
+    if OSINT_MODE == "local":
+        set_stop_event(session_id)
+
+    print(f"⏹️  Arrêt demandé pour session {session_id}")
+
+    # On retourne "stopping" — le statut final sera mis à jour
+    # par run_osint_background quand il aura fini de collecter les partiels
+    return StopResponse(
+        session_id = session_id,
+        message    = "Arrêt en cours — résultats partiels seront sauvegardés dès la fin de l'étape courante",
+        status     = "stopping",
+        result     = None,
+    )
 
 # =========================
-# API 5: NETTOYER LES RÉSULTATS
+# API 5 : NETTOYER SESSION
 # =========================
 
 @app.delete("/session/{session_id}")
 def clear_session(session_id: str):
-    """Nettoie une session terminée"""
     if session_id in sessions:
         session = sessions[session_id]
         with session.lock:
             if session.status in ["completed", "stopped", "error"]:
                 del sessions[session_id]
-                print(f"🗑️ Session {session_id} supprimée")
+                print(f"🗑️  Session {session_id} supprimée")
                 return {"message": "Session supprimée"}
             else:
                 raise HTTPException(
                     status_code=400,
-                    detail=f"Impossible de supprimer - Statut: {session.status}"
+                    detail=f"Impossible de supprimer - Statut : {session.status}",
                 )
     raise HTTPException(status_code=404, detail="Session non trouvée")
 
 # =========================
-# API 6: HEALTH CHECK
+# API 6 : HEALTH CHECK
 # =========================
 
 @app.get("/health")
 def health():
-    """Health check endpoint"""
     return {
-        "status": "ok",
-        "message": "OSINT API Gateway is running",
+        "status"         : "ok",
+        "message"        : "OSINT API Gateway is running",
+        "osint_mode"     : OSINT_MODE,
         "active_sessions": len(sessions),
-        "timestamp": datetime.now().isoformat()
+        "timestamp"      : datetime.now().isoformat(),
     }
 
 # =========================
-# API 7: GET ALL SESSIONS (DEBUG)
+# API 7 : DEBUG — TOUTES SESSIONS
 # =========================
 
 @app.get("/sessions")
 def get_all_sessions():
-    """DEBUG: Voir toutes les sessions actives"""
     return {
         "total_sessions": len(sessions),
         "sessions": {
             sid: {
-                "status": s.status,
-                "progress": s.progress,
-                "logs_count": len(s.logs),
-                "has_result": s.result is not None,
-                "stop_flag": s.stop_flag
+                "status"     : s.status,
+                "progress"   : s.progress,
+                "logs_count" : len(s.logs),
+                "has_result" : s.result is not None,
+                "stop_flag"  : s.stop_flag,
             }
             for sid, s in sessions.items()
-        }
+        },
     }
 
 # =========================
-# API 8: GET SESSION DETAILS (DEBUG)
+# API 8 : DEBUG — DÉTAILS SESSION
 # =========================
 
 @app.get("/session/{session_id}")
 def get_session_details(session_id: str):
-    """DEBUG: Voir les détails d'une session"""
     if session_id not in sessions:
         raise HTTPException(status_code=404, detail="Session non trouvée")
-    
     session = sessions[session_id]
     with session.lock:
         return {
             "session_id": session_id,
-            "status": session.status,
-            "progress": session.progress,
-            "logs": session.logs,
-            "result": session.result,
-            "stop_flag": session.stop_flag
+            "status"    : session.status,
+            "progress"  : session.progress,
+            "logs"      : session.logs,
+            "result"    : session.result,
+            "stop_flag" : session.stop_flag,
         }
 
 # =========================
-# OPTIONS (pour les preflight requests)
+# OPTIONS (preflight CORS)
 # =========================
 
 @app.options("/{full_path:path}")
 async def options_handler(full_path: str):
-    """Gère les requêtes OPTIONS (preflight CORS)"""
     return {}
 
 # =========================
-# ROOT ENDPOINT
+# ROOT
 # =========================
 
 @app.get("/")
 def root():
-    """Root endpoint"""
     return {
-        "app": "OSINT API Gateway",
-        "version": "1.0.2",
-        "status": "running",
-        "features": [
+        "app"      : "OSINT API Gateway",
+        "version"  : "2.0.0",
+        "status"   : "running",
+        "osint_mode": OSINT_MODE,
+        "features" : [
             "Async OSINT search",
             "Real-time progress tracking",
-            "Partial results on stop",
+            "Partial results on stop (real data)",
+            "Per-session stop flag",
             "Session management",
-            "Proper stop handling"
         ],
         "endpoints": {
-            "health": "GET /health",
-            "sessions_debug": "GET /sessions",
-            "session_details": "GET /session/{session_id}",
-            "predict": "POST /predict-osint",
-            "predict_test": "POST /predict-osint-test",
-            "progress": "GET /progress/{session_id}",
-            "stop": "POST /stop/{session_id}",
-            "clear": "DELETE /session/{session_id}",
-        }
+            "health"        : "GET  /health",
+            "sessions_debug": "GET  /sessions",
+            "session_details": "GET  /session/{session_id}",
+            "predict"       : "POST /predict-osint",
+            "predict_test"  : "POST /predict-osint-test",
+            "progress"      : "GET  /progress/{session_id}",
+            "stop"          : "POST /stop/{session_id}",
+            "clear"         : "DELETE /session/{session_id}",
+        },
     }
 
 # =========================
@@ -503,13 +460,15 @@ async def http_exception_handler(request, exc):
     )
 
 # =========================
-# STARTUP/SHUTDOWN
+# STARTUP / SHUTDOWN
 # =========================
 
 @app.on_event("startup")
 async def startup_event():
     print("🚀 OSINT API Gateway démarrée")
-    print(f"📡 Connected to HF Space: {HF_SPACE_URL}")
+    print(f"📡 Mode : {OSINT_MODE}")
+    if OSINT_MODE == "gradio":
+        print(f"   HF Space : {HF_SPACE_URL}")
 
 @app.on_event("shutdown")
 async def shutdown_event():
