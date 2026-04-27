@@ -165,7 +165,7 @@ def run_osint_background(session_id: str, data: OSINTRequest):
                 company_handle = data.company_handle,
                 country_name   = data.country_name,
                 country_iso    = data.country_iso,
-                api_name       = "/run_osint_with_session",
+                api_name       = "/run_osint",
             )
             logs_str, markdown, json_str = result_tuple
 
