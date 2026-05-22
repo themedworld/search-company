@@ -329,7 +329,7 @@ def run_osint_background(session_id: str, data: OSINTRequest):
 def run_osint_background_gradio(session_id: str, data: OSINTRequest):
     """
     Fallback quand app.py n'est pas disponible localement.
-    La progression est simulée (pas d'accès aux étapes internes).
+    Appelle la Gradio App avec le bon endpoint.
     """
     session = get_or_create_session(session_id)
     with session.lock:
@@ -338,7 +338,7 @@ def run_osint_background_gradio(session_id: str, data: OSINTRequest):
         session.logs      = []
         session.stop_flag = False
 
-    # Étapes simulées affichées pendant l'attente
+    # Étapes simulées affichées pendant l'attente Gradio
     SIMULATED_STEPS = [
         (5,  "🔧 Construction du contexte..."),
         (10, "🌐 Recherche du domaine officiel..."),
@@ -364,15 +364,20 @@ def run_osint_background_gradio(session_id: str, data: OSINTRequest):
     sim_thread.start()
 
     try:
+        # ✅ CORRECTION : appel CORRECT au Gradio
+        # La fonction Gradio s'appelle `run_osint` (voir app.py)
+        # Les paramètres sont : company_name, company_handle, country_name, country_iso, target_roles
+        # IMPORTANT : pas de session_id en paramètre pour Gradio (il en génère un lui-même)
+        
         logs_str, markdown, json_str = _gradio_client.predict(
-            company_name     = data.company_name,
-            company_handle   = data.company_handle,
-            country_name     = data.country_name,
-            country_iso      = data.country_iso,
-            session_id       = session_id,
-            target_roles_str = data.target_roles,
-            api_name         = "/run_osint_with_session",
+            company_name=data.company_name,
+            company_handle=data.company_handle,
+            country_name=data.country_name,
+            country_iso=data.country_iso,
+            target_roles=data.target_roles,
+            api_name="/run_osint",  # ✅ ENDPOINT CORRECT
         )
+        
         done_event.set()
 
         logs_list = logs_str.split("\n") if isinstance(logs_str, str) else logs_str
@@ -393,9 +398,10 @@ def run_osint_background_gradio(session_id: str, data: OSINTRequest):
 
     except Exception as e:
         done_event.set()
+        print(f"❌ Erreur Gradio : {e}")
         with session.lock:
             session.status = "error"
-            session.logs.append(f"❌ Erreur : {str(e)}")
+            session.logs.append(f"❌ Erreur Gradio : {str(e)}")
             session.result = {
                 "success"          : False,
                 "partial"          : False,
@@ -404,7 +410,7 @@ def run_osint_background_gradio(session_id: str, data: OSINTRequest):
                 "error"            : str(e),
                 "results_markdown" : "",
                 "results_json"     : "{}",
-                "message"          : "Une erreur s'est produite",
+                "message"          : "Une erreur s'est produite lors de l'appel Gradio",
             }
 
 
@@ -440,14 +446,14 @@ def predict_osint_test(data: OSINTRequest):
                 target_roles_str = data.target_roles,
             )
         else:
+            # ✅ CORRECTION : appel CORRECT au Gradio pour test
             logs_str, markdown, json_str = _gradio_client.predict(
-                company_name     = data.company_name,
-                company_handle   = data.company_handle,
-                country_name     = data.country_name,
-                country_iso      = data.country_iso,
-                session_id       = sid,
-                target_roles_str = data.target_roles,
-                api_name         = "/run_osint_with_session",
+                company_name=data.company_name,
+                company_handle=data.company_handle,
+                country_name=data.country_name,
+                country_iso=data.country_iso,
+                target_roles=data.target_roles,
+                api_name="/run_osint",  # ✅ ENDPOINT CORRECT
             )
 
         return {
