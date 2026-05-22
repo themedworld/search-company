@@ -356,7 +356,7 @@ def run_osint_background_gradio(session_id: str, data: OSINTRequest):
 
     def _simulate():
         for pct, msg in SIMULATED_STEPS:
-            if done_event.wait(timeout=4):   # avance toutes les ~4 s
+            if done_event.wait(timeout=4):
                 break
             _update(session_id, pct, msg)
 
@@ -364,18 +364,14 @@ def run_osint_background_gradio(session_id: str, data: OSINTRequest):
     sim_thread.start()
 
     try:
-        # ✅ CORRECTION : appel CORRECT au Gradio
-        # La fonction Gradio s'appelle `run_osint` (voir app.py)
-        # Les paramètres sont : company_name, company_handle, country_name, country_iso, target_roles
-        # IMPORTANT : pas de session_id en paramètre pour Gradio (il en génère un lui-même)
-        
+        # ✅ CORRECTION : appel CORRECT au Gradio avec target_roles_str
         logs_str, markdown, json_str = _gradio_client.predict(
             company_name=data.company_name,
             company_handle=data.company_handle,
             country_name=data.country_name,
             country_iso=data.country_iso,
-            target_roles=data.target_roles,
-            api_name="/run_osint",  # ✅ ENDPOINT CORRECT
+            target_roles_str=data.target_roles,  # ✅ AVEC _str SUFFIX
+            api_name="/run_osint",
         )
         
         done_event.set()
@@ -446,14 +442,14 @@ def predict_osint_test(data: OSINTRequest):
                 target_roles_str = data.target_roles,
             )
         else:
-            # ✅ CORRECTION : appel CORRECT au Gradio pour test
+            # ✅ CORRECTION : appel CORRECT au Gradio avec target_roles_str
             logs_str, markdown, json_str = _gradio_client.predict(
                 company_name=data.company_name,
                 company_handle=data.company_handle,
                 country_name=data.country_name,
                 country_iso=data.country_iso,
-                target_roles=data.target_roles,
-                api_name="/run_osint",  # ✅ ENDPOINT CORRECT
+                target_roles_str=data.target_roles,  # ✅ AVEC _str SUFFIX
+                api_name="/run_osint",
             )
 
         return {
@@ -616,7 +612,7 @@ async def options_handler(full_path: str):
 def root():
     return {
         "app"       : "OSINT API Gateway",
-        "version"   : "3.0.0",
+        "version"   : "3.0.1",
         "osint_mode": OSINT_MODE,
         "endpoints" : {
             "health"          : "GET    /health",
@@ -647,8 +643,10 @@ async def http_exception_handler(request, exc):
 
 @app.on_event("startup")
 async def startup_event():
-    print("🚀 OSINT API Gateway v3 démarrée")
+    print("🚀 OSINT API Gateway v3.0.1 démarrée")
     print(f"📡 Mode : {OSINT_MODE}")
+    if OSINT_MODE == "gradio":
+        print(f"   🔗 Gradio URL: {HF_SPACE_URL}")
 
 @app.on_event("shutdown")
 async def shutdown_event():
